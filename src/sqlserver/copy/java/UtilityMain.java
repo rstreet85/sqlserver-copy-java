@@ -3,8 +3,10 @@
  */
 package sqlserver.copy.java;
 
+import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.File;
+import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.sql.Connection;
@@ -12,9 +14,14 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.List;
+import java.util.logging.Level;
 import org.apache.commons.csv.CSVFormat;
+import org.apache.commons.csv.CSVParser;
 import org.apache.commons.csv.CSVPrinter;
+import org.apache.commons.csv.CSVRecord;
 
 /**
  * This program reads the data from SQL Server table, prints to CSV, then inserts CSV into new SQL Server table.
@@ -22,31 +29,35 @@ import org.apache.commons.csv.CSVPrinter;
  * @author Robert Streetman
  */
 public class UtilityMain {
-    private static String url;
-    private static String tblName;
-    private static String tblSchema;
-    private static String fileName;
+    private static String urlInput;
+    private static String urlOutput;
+    private static String tblNameInput;
+    private static String tblNameOutput;
+    private static String tblSchemaInput;
+    private static String tblSchemaOutput;
+    private static File tableFile;
     
     /**
-     * @param args url, tbl_schema, tbl_name, csv_file_name
+     * @param args url_input, input_tbl_schema, input_tbl_name, url_output, output_tbl_schema, output_tbl_name
      */
     public static void main(String[] args) {
         //These parameters were provided in original service
-        url = args[0];
-        tblSchema = args[1];
-        tblName = args[2];
-        fileName = args[3];
+        urlInput = args[0];
+        tblSchemaInput = args[1];
+        tblNameInput = args[2];
+        urlOutput = args[3];
+        tblSchemaOutput = args[4];
+        tblNameOutput = args[5];
         
         readTable();
-        //ToDo
+        writeTable();
     }
     
     private static void readTable() {
         try {
             Class.forName("com.microsoft.sqlserver.jdbc.SQLServerDriver");
             
-            try (Connection conn = DriverManager.getConnection(url)) {
-                File tableFile;
+            try (Connection conn = DriverManager.getConnection(urlInput)) {
                 ArrayList<String> columnNames = new ArrayList();
                 ArrayList<String> columnTypes = new ArrayList();
                 ArrayList<String> columnNullable = new ArrayList();
@@ -66,8 +77,8 @@ public class UtilityMain {
                     + "INFORMATION_SCHEMA.COLUMNS col LEFT JOIN INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE "
                     + "usage ON usage.TABLE_NAME=col.TABLE_NAME AND usage.COLUMN_NAME=col.COLUMN_NAME WHERE "
                     + "col.TABLE_NAME=? AND col.TABLE_SCHEMA=?;");
-                pStmnt.setString(1, tblName);
-                pStmnt.setString(2, tblSchema);
+                pStmnt.setString(1, tblNameInput);
+                pStmnt.setString(2, tblSchemaInput);
 
                 //Read column data from INFORMATION_SCHEMA
                 try (ResultSet results = pStmnt.executeQuery()) {
@@ -113,7 +124,7 @@ public class UtilityMain {
                 }
 
                 //Create CSV filewriter
-                tableFile = new File(fileName);
+                tableFile = new File(tblNameInput + ".csv");
                 CSVFormat csvFormat = CSVFormat.DEFAULT.withFirstRecordAsHeader();
                 CSVPrinter csvWriter = new CSVPrinter(
                         new BufferedWriter( new FileWriter(tableFile)), csvFormat);
@@ -146,8 +157,8 @@ public class UtilityMain {
 
                 qryTable.append(" FROM ?.?;");
                 pStmnt = conn.prepareStatement(qryTable.toString());
-                pStmnt.setString(1, tblSchema);
-                pStmnt.setString(2, tblName);
+                pStmnt.setString(1, tblSchemaInput);
+                pStmnt.setString(2, tblNameInput);
 
                 //Read table rows, print to CSV
                 try (ResultSet results = pStmnt.executeQuery()) {
@@ -162,6 +173,152 @@ public class UtilityMain {
             }
         } catch(ClassNotFoundException ex) {
             System.out.format("ClassNotFoundException thrown: %s", ex.getMessage());
+        }
+    }
+    
+    private static void writeTable() {
+        try {
+            Class.forName("com.microsoft.sqlserver.jdbc.SQLServerDriver");
+            
+            try (Connection conn = DriverManager.getConnection(urlOutput);
+                    Statement stmt = conn.createStatement()) {
+                ArrayList<String> columnNames = new ArrayList();
+                ArrayList<String> columnTypes = new ArrayList();
+                ArrayList<String> columnConstraints = new ArrayList();
+                
+                //Build string to delete old temp table, if exists
+                PreparedStatement pStmnt = conn.prepareStatement("IF EXISTS (SELECT * FROM sysobjects WHERE id=object_id(N?) AND OBJECTPROPERTY(id, N'IsUserTable')=1) DROP TABLE ?;");
+                pStmnt.setString(1, tblNameOutput);
+                pStmnt.setString(2, tblNameOutput);
+
+                //Build CREATE statement for table
+                StringBuilder qryCreate = new StringBuilder("CREATE TABLE ");
+                qryCreate.append(tblNameOutput);
+                qryCreate.append(" (");
+
+                //Read headers from file. First line may be blank
+                BufferedReader br = new BufferedReader(new FileReader(tableFile));
+                String line = br.readLine();
+
+                if (line == null || line.equals("\\s") || line.length() == 0) {
+                    line = br.readLine();
+                }
+
+                br.close();
+                String[] colNames = line.split(",");
+                int numColumns = colNames.length;
+                System.out.println("Number of columns: " + numColumns);
+
+                for (int i = 0; i < numColumns; i++) {
+                    columnNames.add(colNames[i]);
+                }
+
+                //Create CSV file reader
+                CSVFormat csvForm = CSVFormat.DEFAULT.withHeader(colNames).withDelimiter(',');
+                CSVParser parser = new CSVParser(new FileReader(tableFile), csvForm);
+                List records = parser.getRecords();
+                int numRecords = records.size();
+
+                //Read data types
+                CSVRecord tempRecord = (CSVRecord) records.get(1);
+
+                for (String column : columnNames) {
+                    columnTypes.add(tempRecord.get(column));
+                }
+
+                //Read column constraints
+                tempRecord = (CSVRecord) records.get(2);
+
+                for (String column : columnNames) {
+                    columnConstraints.add(tempRecord.get(column));
+                }
+
+                //Build CREATE statement with headers, types & constraints
+                for (int i = 0; i < numColumns; i++) {
+                    //qryCreate.append(columnNames.get(i));
+                    //qryCreate.append(" ");
+                    //qryCreate.append(columnTypes.get(i));
+                    //qryCreate.append(" ");
+                    //qryCreate.append(columnConstraints.get(i));
+                    qryCreate.append("? ? ?");
+                    
+                    if (i < numColumns - 1) {
+                        qryCreate.append(", ");
+                    }
+                }
+
+                qryCreate.append(");");
+                pStmnt = conn.prepareStatement(qryCreate.toString());
+                
+                //Set parameters in threes
+                for (int i = 1; i < numColumns + 1; i++) {
+                    pStmnt.setString(i*3 - 2, columnNames.get(i));
+                    pStmnt.setString(i*3 - 1, columnTypes.get(i));
+                    pStmnt.setString(i*3, columnConstraints.get(i));
+                }
+                
+                pStmnt.executeUpdate();
+
+                //Read records (skip headers) from file, insert into new table
+                //TODO: Switch to preparedstatement
+                StringBuilder insertQry;
+                for (int i = 3; i < numRecords; i++) {
+                    tempRecord = (CSVRecord) records.get(i);
+                    insertQry = new StringBuilder();
+                    insertQry.append("INSERT INTO ");
+                    insertQry.append(tblNameOutput);
+                    insertQry.append(" (");
+
+                    for (int j = 0; j < numColumns; j++) {
+                        insertQry.append(columnNames.get(j));
+
+                        if (j < numColumns - 1) {
+                            insertQry.append(", ");
+                        }
+                    }
+
+                    insertQry.append(") VALUES (");
+
+                    for (int j = 0; j < numColumns; j++) {
+                        String entry = tempRecord.get(columnNames.get(j));
+                        String type = columnTypes.get(j);
+
+                        if (entry == null || entry.length() == 0 || entry.equals("")) {
+                            if (type.equals("text") || type.contains("char") || type.contains("varchar")
+                                || type.contains("nchar") || type.contains("nvarchar")) {
+                                insertQry.append("''");
+                            } else {
+                                insertQry.append("NULL");
+                            }
+                        } else if (type.equals("text") || type.contains("char") || type.contains("varchar")
+                                || type.contains("nchar") || type.contains("nvarchar")) {
+                            insertQry.append("'");
+                            insertQry.append(entry.replace("\'", "\'\'"));
+                            insertQry.append("'");
+                        } else {
+                            insertQry.append(entry);
+                        }
+
+                        if (j < numColumns - 1) {
+                            insertQry.append(", ");
+                        }
+                    }
+
+                    insertQry.append(");");
+                    System.out.println(insertQry.toString());
+                    stmt.execute(insertQry.toString());
+                }
+
+                //TODO: Update data to new table BEFORE deleting old table to avoid unneccessary data loss
+                /*
+                stmt.execute(DBQueries.SVAP02Query02(tblNameOld));
+                stmt.execute(DBQueries.SVAP02Query03(tblName, tblNameOld));
+                */
+            } catch (SQLException | IOException ex) {
+                
+            }
+        } catch(ClassNotFoundException ex) {
+            
         }
     }
     

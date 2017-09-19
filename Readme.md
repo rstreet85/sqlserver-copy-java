@@ -6,5 +6,5 @@ A Java program to extract and insert data into MS SQL Server. Based on web servi
 Password-protected databases not currently supported.
 
 
-Input: `database_url tbl_schema tbl_name filename`
+Input: `original_database_url original_tbl_schema original_tbl_name new_database_url new_tbl_schema new_tbl_name`
 Output: `filename.csv`
